@@ -2,7 +2,7 @@
 Ballpark Stats — anonymous aggregate stats server.
 
 Powers the "you scored higher than X% of today's players" line on
-share cards. One file, FastAPI + SQLite.
+share cards, and the daily friend-duel flow. One file, FastAPI + SQLite.
 
 Endpoints:
 - POST /round — record a played round. No PII beyond a device id.
@@ -12,6 +12,13 @@ Endpoints:
 - GET /question-aggregate/{puzzle_number}/{question_index} — median
   and count of a single question's guesses. Powers the
   call-your-shot chip on the iOS round.
+- POST /duel — create a duel from a finished round. Returns a token.
+- GET /duel/{duel_token} — fetch a duel's state.
+- POST /duel/{duel_token}/join — claim the joiner slot.
+- POST /duel/{duel_token}/result — submit a player's result; flips
+  the duel to 'completed' when both sides have scores.
+- GET /duels/open/{device_id} — open duels for a device (polled on
+  app open + scenePhase active).
 - GET /privacy — human-readable privacy disclosure.
 - DELETE /me/{device_id} — purge all rows for a device.
 - GET / — health check (returns 200).
@@ -22,7 +29,9 @@ Deploy:
 
 import math
 import os
+import secrets
 import sqlite3
+import string
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional
@@ -37,6 +46,30 @@ from pydantic import BaseModel, Field, field_validator
 
 DB_PATH = os.environ.get("BALLPARK_DB", "ballpark.db")
 MAX_RETAINED_DAYS = int(os.environ.get("BALLPARK_RETAIN_DAYS", "60"))
+# Open duels older than this get expired by the retention sweep.
+# 7 days matches the iOS app's expectation (a daily puzzle's duel is
+# stale within ~48h, but we keep a week of headroom for slow friends).
+DUEL_EXPIRY_DAYS = int(os.environ.get("BALLPARK_DUEL_EXPIRY_DAYS", "7"))
+DUEL_TOKEN_ALPHABET = string.ascii_letters + string.digits
+DUEL_TOKEN_LEN = 12
+
+
+def new_duel_token() -> str:
+    """Random 12-char alphanumeric duel token. ~62^12 ≈ 3e21 space —
+    no collision check needed at this scale."""
+    return "".join(secrets.choice(DUEL_TOKEN_ALPHABET) for _ in range(DUEL_TOKEN_LEN))
+
+
+def _clean_device_id(v: str) -> str:
+    """Shared validator for device_id fields. Restricts to URL-safe
+    characters. identifierForVendor is a UUID, but be defensive —
+    the duel endpoints accept the same id space as /round."""
+    allowed = set(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+    )
+    if not v or len(v) > 64 or not all(c in allowed for c in v):
+        raise ValueError("device_id contains invalid characters")
+    return v
 
 # ----------------------------------------------------------------------------
 # DB
@@ -101,6 +134,45 @@ def init_db() -> None:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_qg_puzzle_q ON question_guesses(puzzle_number, question_index)"
+        )
+        # Duels (Phase D1). One row per duel. The initiator creates a
+        # duel after finishing their round; the joiner claims the slot
+        # by opening the share link. Both sides submit their score +
+        # grid; when both are present, status flips to 'completed'.
+        # No PII: device_id is identifierForVendor, name is whatever
+        # the sender typed (defaults to a random Adjective Noun on the
+        # client). Grid is a JSON array of color-tier ints (0..3).
+        # initiator_device_id is nullable so /me can blank a deleted
+        # user out of a duel without breaking the NOT NULL constraint
+        # — the joiner sees the duel as 'expired' in that case.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS duels (
+                duel_token TEXT PRIMARY KEY,
+                puzzle_number INTEGER NOT NULL,
+                theme_name TEXT,
+                initiator_device_id TEXT,
+                initiator_name TEXT,
+                initiator_score INTEGER,
+                initiator_grid TEXT,
+                initiator_played_at TEXT,
+                joiner_device_id TEXT,
+                joiner_score INTEGER,
+                joiner_grid TEXT,
+                joiner_played_at TEXT,
+                status TEXT NOT NULL DEFAULT 'open',
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_duels_initiator ON duels(initiator_device_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_duels_joiner ON duels(joiner_device_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_duels_status ON duels(status, created_at)"
         )
 
 
@@ -180,6 +252,113 @@ class QuestionAggregateOut(BaseModel):
     count: int
 
 
+# --- Duel models (Phase D1) -------------------------------------------------
+
+
+class DuelCreateIn(BaseModel):
+    """Initiator creates a duel after finishing their round. The
+    share URL the iOS app builds is `https://ballpark.app/d?k=<token>`
+    where <token> is returned here."""
+
+    puzzle_number: int = Field(..., gt=0, le=100_000)
+    theme_name: Optional[str] = Field(default=None, max_length=64)
+    initiator_device_id: str = Field(..., min_length=1, max_length=64)
+    initiator_name: Optional[str] = Field(default=None, max_length=64)
+    initiator_score: int = Field(..., ge=0, le=10_000)
+    # JSON-encoded array of color-tier ints (0..3), one per question.
+    # Length cap is generous — rounds are currently 10 questions but
+    # we don't want to break if that changes.
+    initiator_grid: str = Field(default="[]", max_length=512)
+    initiator_played_at: str = Field(..., min_length=10, max_length=40)
+
+    @field_validator("initiator_device_id")
+    @classmethod
+    def _init_dev(cls, v: str) -> str:
+        return _clean_device_id(v)
+
+    @field_validator("initiator_played_at")
+    @classmethod
+    def _init_played(cls, v: str) -> str:
+        try:
+            datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            raise ValueError("initiator_played_at must be ISO 8601")
+        return v
+
+
+class DuelJoinIn(BaseModel):
+    """Joiner claims the duel. device_id must differ from the
+    initiator's (you can't duel yourself)."""
+
+    device_id: str = Field(..., min_length=1, max_length=64)
+
+    @field_validator("device_id")
+    @classmethod
+    def _join_dev(cls, v: str) -> str:
+        return _clean_device_id(v)
+
+
+class DuelResultIn(BaseModel):
+    """Either side submits their score + grid. Updates whichever side
+    matches device_id. If both sides now have scores, status flips
+    to 'completed'."""
+
+    device_id: str = Field(..., min_length=1, max_length=64)
+    score: int = Field(..., ge=0, le=10_000)
+    grid: str = Field(default="[]", max_length=512)
+    played_at: str = Field(..., min_length=10, max_length=40)
+
+    @field_validator("device_id")
+    @classmethod
+    def _res_dev(cls, v: str) -> str:
+        return _clean_device_id(v)
+
+    @field_validator("played_at")
+    @classmethod
+    def _res_played(cls, v: str) -> str:
+        try:
+            datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            raise ValueError("played_at must be ISO 8601")
+        return v
+
+
+class DuelOut(BaseModel):
+    duel_token: str
+    puzzle_number: int
+    theme_name: Optional[str] = None
+    initiator_device_id: Optional[str] = None
+    initiator_name: Optional[str] = None
+    initiator_score: Optional[int] = None
+    initiator_grid: Optional[str] = None
+    initiator_played_at: Optional[str] = None
+    joiner_device_id: Optional[str] = None
+    joiner_score: Optional[int] = None
+    joiner_grid: Optional[str] = None
+    joiner_played_at: Optional[str] = None
+    status: str
+    created_at: str
+
+
+def row_to_duel(row: sqlite3.Row) -> DuelOut:
+    return DuelOut(
+        duel_token=row["duel_token"],
+        puzzle_number=row["puzzle_number"],
+        theme_name=row["theme_name"],
+        initiator_device_id=row["initiator_device_id"],
+        initiator_name=row["initiator_name"],
+        initiator_score=row["initiator_score"],
+        initiator_grid=row["initiator_grid"],
+        initiator_played_at=row["initiator_played_at"],
+        joiner_device_id=row["joiner_device_id"],
+        joiner_score=row["joiner_score"],
+        joiner_grid=row["joiner_grid"],
+        joiner_played_at=row["joiner_played_at"],
+        status=row["status"],
+        created_at=row["created_at"],
+    )
+
+
 # ----------------------------------------------------------------------------
 # Percentile helpers
 # ----------------------------------------------------------------------------
@@ -242,8 +421,8 @@ def compute_question_aggregate(guesses: list[float]) -> dict:
 
 app = FastAPI(
     title="Ballpark Stats",
-    version="0.1.0",
-    description="Anonymous aggregate stats for the Close Enough iOS app.",
+    version="0.2.0",
+    description="Anonymous aggregate stats + daily friend duels for the Close Enough iOS app.",
 )
 
 
@@ -350,12 +529,245 @@ def get_question_aggregate(puzzle_number: int, question_index: int) -> QuestionA
     )
 
 
+# ----------------------------------------------------------------------------
+# Duels (Phase D1)
+# ----------------------------------------------------------------------------
+
+
+@app.post("/duel", response_model=DuelOut, status_code=201)
+def create_duel(payload: DuelCreateIn) -> DuelOut:
+    """Initiator creates a duel after finishing their round. Returns
+    the full duel row (including the token the iOS app uses to build
+    the share URL `https://ballpark.app/d?k=<token>`).
+
+    No PII: device_id is identifierForVendor, name is a client-side
+    random 'Adjective Noun' pair (or whatever the player typed)."""
+    token = new_duel_token()
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO duels (
+                duel_token, puzzle_number, theme_name,
+                initiator_device_id, initiator_name, initiator_score,
+                initiator_grid, initiator_played_at, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open')
+            """,
+            (
+                token,
+                payload.puzzle_number,
+                payload.theme_name,
+                payload.initiator_device_id,
+                payload.initiator_name,
+                payload.initiator_score,
+                payload.initiator_grid,
+                payload.initiator_played_at,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM duels WHERE duel_token = ?", (token,)
+        ).fetchone()
+    return row_to_duel(row)
+
+
+@app.get("/duel/{duel_token}", response_model=DuelOut)
+def get_duel(duel_token: str) -> DuelOut:
+    """Fetch a duel's current state. Used by both sides to poll for
+    results (since APNs is deferred, the iOS app polls this on
+    scenePhase becoming active)."""
+    if len(duel_token) != DUEL_TOKEN_LEN or not all(
+        c in DUEL_TOKEN_ALPHABET for c in duel_token
+    ):
+        raise HTTPException(status_code=400, detail="invalid duel_token")
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM duels WHERE duel_token = ?", (duel_token,)
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="duel not found")
+    return row_to_duel(row)
+
+
+@app.post("/duel/{duel_token}/join", response_model=DuelOut)
+def join_duel(duel_token: str, payload: DuelJoinIn) -> DuelOut:
+    """Claim the joiner slot of an open duel. Atomic: uses a single
+    UPDATE with a WHERE guard so two simultaneous joiners can't both
+    win. 409 if the duel is already claimed by a different device.
+    404 if the duel doesn't exist. 400 if you try to join your own
+    duel (initiator_device_id == payload.device_id)."""
+    if len(duel_token) != DUEL_TOKEN_LEN or not all(
+        c in DUEL_TOKEN_ALPHABET for c in duel_token
+    ):
+        raise HTTPException(status_code=400, detail="invalid duel_token")
+    with get_db() as conn:
+        # BEGIN IMMEDIATE acquires a write lock immediately so the
+        # read-check-write below is atomic against other joiners.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT * FROM duels WHERE duel_token = ?", (duel_token,)
+            ).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                raise HTTPException(status_code=404, detail="duel not found")
+            if row["status"] != "open":
+                # Already completed/expired — but allow the existing
+                # joiner to re-join (idempotent, useful if they tapped
+                # the link twice or the app re-handled the URL).
+                if row["joiner_device_id"] != payload.device_id:
+                    conn.execute("ROLLBACK")
+                    raise HTTPException(
+                        status_code=409, detail="duel already claimed"
+                    )
+            elif row["initiator_device_id"] == payload.device_id:
+                conn.execute("ROLLBACK")
+                raise HTTPException(
+                    status_code=400, detail="can't join your own duel"
+                )
+            elif (
+                row["joiner_device_id"] is not None
+                and row["joiner_device_id"] != payload.device_id
+            ):
+                # Open duel but someone else already claimed the slot.
+                conn.execute("ROLLBACK")
+                raise HTTPException(
+                    status_code=409, detail="duel already claimed"
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE duels SET joiner_device_id = ?
+                    WHERE duel_token = ? AND status = 'open'
+                    """,
+                    (payload.device_id, duel_token),
+                )
+            row = conn.execute(
+                "SELECT * FROM duels WHERE duel_token = ?", (duel_token,)
+            ).fetchone()
+            conn.execute("COMMIT")
+        except HTTPException:
+            raise
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return row_to_duel(row)
+
+
+@app.post("/duel/{duel_token}/result", response_model=DuelOut)
+def submit_duel_result(duel_token: str, payload: DuelResultIn) -> DuelOut:
+    """Submit a player's result. Updates whichever side matches
+    device_id. If both sides now have scores, flips status to
+    'completed'.
+
+    The initiator normally has their score set at creation time, so
+    this endpoint mostly handles the joiner's submission. But it
+    handles either side symmetrically for robustness (e.g. initiator
+    replays the round and resubmits)."""
+    if len(duel_token) != DUEL_TOKEN_LEN or not all(
+        c in DUEL_TOKEN_ALPHABET for c in duel_token
+    ):
+        raise HTTPException(status_code=400, detail="invalid duel_token")
+    with get_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT * FROM duels WHERE duel_token = ?", (duel_token,)
+            ).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                raise HTTPException(status_code=404, detail="duel not found")
+            if row["status"] not in ("open", "completed"):
+                conn.execute("ROLLBACK")
+                raise HTTPException(
+                    status_code=409, detail=f"duel is {row['status']}"
+                )
+            is_initiator = row["initiator_device_id"] == payload.device_id
+            is_joiner = row["joiner_device_id"] == payload.device_id
+            if not (is_initiator or is_joiner):
+                conn.execute("ROLLBACK")
+                raise HTTPException(
+                    status_code=403, detail="device is not in this duel"
+                )
+            if is_initiator:
+                conn.execute(
+                    """
+                    UPDATE duels SET
+                        initiator_score = ?,
+                        initiator_grid = ?,
+                        initiator_played_at = ?
+                    WHERE duel_token = ?
+                    """,
+                    (payload.score, payload.grid, payload.played_at, duel_token),
+                )
+            if is_joiner:
+                conn.execute(
+                    """
+                    UPDATE duels SET
+                        joiner_score = ?,
+                        joiner_grid = ?,
+                        joiner_played_at = ?
+                    WHERE duel_token = ?
+                    """,
+                    (payload.score, payload.grid, payload.played_at, duel_token),
+                )
+            # Flip to completed if both sides have scores.
+            row = conn.execute(
+                "SELECT * FROM duels WHERE duel_token = ?", (duel_token,)
+            ).fetchone()
+            if (
+                row["initiator_score"] is not None
+                and row["joiner_score"] is not None
+                and row["status"] == "open"
+            ):
+                conn.execute(
+                    "UPDATE duels SET status = 'completed' WHERE duel_token = ?",
+                    (duel_token,),
+                )
+                row = conn.execute(
+                    "SELECT * FROM duels WHERE duel_token = ?", (duel_token,)
+                ).fetchone()
+            conn.execute("COMMIT")
+        except HTTPException:
+            raise
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return row_to_duel(row)
+
+
+@app.get("/duels/open/{device_id}", response_model=list[DuelOut])
+def list_open_duels(device_id: str) -> list[DuelOut]:
+    """Open (not-completed, not-expired) duels where this device is
+    either initiator or joiner. Polled by the iOS app on app open and
+    on scenePhase becoming active — this is the polling fallback for
+    the deferred-APNs world. Includes duels the device hasn't joined
+    yet (initiator-side, waiting for a friend) and duels waiting for
+    this device to play (joiner-side, claimed but no result yet)."""
+    try:
+        _clean_device_id(device_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid device_id")
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM duels
+            WHERE status = 'open'
+              AND (initiator_device_id = ? OR joiner_device_id = ?)
+              AND created_at >= datetime('now', ?)
+            ORDER BY created_at DESC
+            """,
+            (device_id, device_id, f"-{DUEL_EXPIRY_DAYS} days"),
+        ).fetchall()
+    return [row_to_duel(r) for r in rows]
+
+
 @app.delete("/me/{device_id}", status_code=204)
 def delete_device(device_id: str) -> Response:
     """Purge all rows for a device. Wired up from a 'Delete my data'
     button in the iOS app's settings screen. Cascades to per-question
     guesses so the call-your-shot aggregate for this device is also
-    removed."""
+    removed. Also removes the device from any duel (initiator or
+    joiner) — the duel row is kept so the other side still has a
+    result, but this device's identity is blanked."""
     if not (1 <= len(device_id) <= 64):
         raise HTTPException(status_code=400, detail="invalid device_id")
     allowed = set(
@@ -367,6 +779,39 @@ def delete_device(device_id: str) -> Response:
         conn.execute("DELETE FROM rounds WHERE device_id = ?", (device_id,))
         conn.execute(
             "DELETE FROM question_guesses WHERE device_id = ?", (device_id,)
+        )
+        # Blank this device out of any duel it's in. We don't delete
+        # the row because the other side may still want their result.
+        # If the device was the initiator of an open duel, the duel is
+        # effectively dead — flip to 'expired'.
+        conn.execute(
+            """
+            UPDATE duels SET
+                initiator_device_id = NULL,
+                initiator_name = NULL,
+                initiator_score = NULL,
+                initiator_grid = NULL,
+                initiator_played_at = NULL
+            WHERE initiator_device_id = ?
+            """,
+            (device_id,),
+        )
+        conn.execute(
+            """
+            UPDATE duels SET
+                joiner_device_id = NULL,
+                joiner_score = NULL,
+                joiner_grid = NULL,
+                joiner_played_at = NULL
+            WHERE joiner_device_id = ?
+            """,
+            (device_id,),
+        )
+        conn.execute(
+            """
+            UPDATE duels SET status = 'expired'
+            WHERE status = 'open' AND initiator_device_id IS NULL
+            """,
         )
     return Response(status_code=204)
 
@@ -408,6 +853,11 @@ on share cards.</p>
   <li>The date you played.</li>
   <li>An anonymous device identifier (Apple&rsquo;s <code>identifierForVendor</code>,
       which resets if you reinstall the app).</li>
+  <li>When you start or join a duel: the duel token, your device id,
+      the name you typed (optional — defaults to a random
+      &ldquo;Adjective Noun&rdquo;), your score, and your color-tier
+      grid. This is the minimum needed to show a head-to-head
+      scorecard to the friend you duelled.</li>
 </ul>
 
 <h2>What we do NOT collect</h2>
@@ -470,6 +920,19 @@ async def maybe_cleanup_old_data(request: Request, call_next):
                     WHERE played_at < datetime('now', ?)
                     """,
                     (f"-{MAX_RETAINED_DAYS} days",),
+                )
+                # Expire open duels older than DUEL_EXPIRY_DAYS. We
+                # flip to 'expired' rather than DELETE so a slow
+                # joiner who opens the link after the cutoff gets a
+                # clean 'this duel has expired' message instead of a
+                # 404 (which would look like a typo).
+                conn.execute(
+                    """
+                    UPDATE duels SET status = 'expired'
+                    WHERE status = 'open'
+                      AND created_at < datetime('now', ?)
+                    """,
+                    (f"-{DUEL_EXPIRY_DAYS} days",),
                 )
         except Exception:
             # Retention cleanup is best-effort. Don't break the
