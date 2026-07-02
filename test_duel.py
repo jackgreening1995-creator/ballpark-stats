@@ -9,7 +9,9 @@ device claim, non-participant result, /me purge, replay resubmit).
 """
 
 import json
+import importlib
 import os
+import sys
 import tempfile
 
 from fastapi.testclient import TestClient
@@ -19,12 +21,18 @@ DEV_B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 DEV_C = "cccccccc-cccc-cccc-cccc-cccccccccccc"
 
 
-def _make_client():
+def _make_client(extra_env=None):
     """Return a TestClient backed by a fresh temp DB."""
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp.close()
     os.environ["BALLPARK_DB"] = tmp.name
-    from main import app  # import after env is set
+    os.environ.pop("DATABASE_URL", None)
+    if extra_env:
+        for key, value in extra_env.items():
+            os.environ[key] = value
+    if "main" in sys.modules:
+        del sys.modules["main"]
+    app = importlib.import_module("main").app
 
     return TestClient(app), tmp.name
 
@@ -213,6 +221,60 @@ def test_initiator_resubmit_replay():
             assert r.status_code == 200
             assert r.json()["initiator_score"] == 1500
             assert r.json()["status"] == "completed"
+    finally:
+        os.unlink(db_path)
+
+
+def test_event_summary():
+    client, db_path = _make_client({"BALLPARK_ADMIN_TOKEN": "secret-token"})
+    try:
+        with client:
+            client.post("/round", json={
+                "puzzle_number": 600,
+                "total_score": 980,
+                "device_id": DEV_A,
+                "played_at": "2026-07-02T09:00:00Z",
+                "guesses": [100.0],
+            })
+            client.post("/round", json={
+                "puzzle_number": 599,
+                "total_score": 930,
+                "device_id": DEV_A,
+                "played_at": "2026-07-01T09:00:00Z",
+                "guesses": [90.0],
+            })
+            client.post("/round", json={
+                "puzzle_number": 599,
+                "total_score": 870,
+                "device_id": DEV_B,
+                "played_at": "2026-07-01T10:00:00Z",
+                "guesses": [80.0],
+            })
+
+            assert client.post("/event", json={
+                "device_id": DEV_A,
+                "event_name": "app_open",
+            }).status_code == 204
+            assert client.post("/event", json={
+                "device_id": DEV_A,
+                "event_name": "share_tap",
+            }).status_code == 204
+            assert client.post("/event", json={
+                "device_id": DEV_A,
+                "event_name": "duel_created",
+            }).status_code == 204
+
+            summary = client.get(
+                "/admin/summary",
+                headers={"x-admin-token": "secret-token"},
+            )
+            assert summary.status_code == 200
+            payload = summary.json()
+            assert payload["latest_puzzle_number"] == 600
+            assert payload["daily_play_count"] == 1
+            assert payload["event_counts_today"]["share_tap"] == 1
+            assert payload["duel_funnel"]["created"] == 1
+            assert payload["d1_return_rate"] == 0.5
     finally:
         os.unlink(db_path)
 

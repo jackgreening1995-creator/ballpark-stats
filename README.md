@@ -1,15 +1,23 @@
 # Ballpark Stats
 
-Anonymous aggregate stats server for the [Close Enough](https://github.com/jackgreening1995-creator/close-enough) iOS app.
+Anonymous aggregate stats server for the Ballpark iOS app.
 
-Powers the *"You scored higher than X% of today's players"* line on share cards. One file (`main.py`), FastAPI + SQLite, ~200 lines.
+Powers the share percentile, question medians, duel flow, and soft-launch event counters. One file (`main.py`), FastAPI, SQLite for local dev, Postgres in production.
 
 ## Endpoints
 
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/round` | Record a played round. Body: `{puzzle_number, total_score, device_id, played_at}`. 204 on success. |
+| `POST` | `/event` | Record anonymous event pings. Body: `{device_id, event_name}`. |
 | `GET`  | `/stats/{n}` | `{median, p25, p75, count}` for puzzle n. 0-count when no data. |
+| `GET`  | `/question-aggregate/{n}/{i}` | Median guess + count for one question slot. |
+| `POST` | `/duel` | Create a friend duel and return a token. |
+| `GET`  | `/duel/{token}` | Fetch a duel's current state. |
+| `POST` | `/duel/{token}/join` | Claim the joiner slot. |
+| `POST` | `/duel/{token}/result` | Submit a duel result. |
+| `GET`  | `/duels/open/{device_id}` | Poll open duels for one device. |
+| `GET`  | `/admin/summary` | Token-protected launch funnel summary. |
 | `GET`  | `/privacy` | Public HTML privacy disclosure. |
 | `DELETE` | `/me/{device_id}` | Purge all rows for a device. 204 on success. |
 | `GET`  | `/` | Health check. Returns 200 with `{ok: true}`. |
@@ -20,6 +28,9 @@ Powers the *"You scored higher than X% of today's players"* line on share cards.
 pip install -r requirements.txt
 uvicorn main:app --reload
 ```
+
+SQLite is the default local store. To test the production path, set
+`DATABASE_URL` to a Postgres connection string first.
 
 Then:
 ```bash
@@ -35,32 +46,31 @@ curl http://localhost:8000/privacy
 # → HTML page
 ```
 
-## Deploy to Railway
+## Deploy
 
-1. Create a new GitHub repo for this server (suggested: `ballpark-stats`).
-2. Push this directory to it: `git init && git add . && git commit -m "init" && git remote add origin <url> && git push -u origin main`
-3. Sign up at [railway.app](https://railway.app) (free tier, no card).
-4. New Project → Deploy from GitHub → select the repo.
-5. Railway auto-detects the `Procfile` and runs `uvicorn`. Free tier will be $0-5/mo depending on usage.
-6. Once deployed, copy the assigned URL (e.g. `https://ballpark-stats-production.up.railway.app`). That's the `STATS_BASE_URL` for the iOS app.
+Set these env vars in production:
+
+- `DATABASE_URL` — Neon/Postgres connection string
+- `BALLPARK_ADMIN_TOKEN` — token for `/admin/summary`
+- `BALLPARK_RETAIN_DAYS` — optional retention override
+- `BALLPARK_DUEL_EXPIRY_DAYS` — optional duel expiry override
 
 ## Privacy
 
 See `/privacy` and the inline docstrings. The server is **anonymous by design**:
-- No auth, no cookies, no IP logging beyond what Railway does at the load balancer.
+- No auth, no cookies, no IP logging beyond what the host does at the load balancer.
 - `device_id` is `identifierForVendor`, which resets on app reinstall.
 - No PII, no name, no email, no contacts, no location, no advertising id.
 - Retention is 60 days by default (configurable via `BALLPARK_RETAIN_DAYS` env var).
 - `DELETE /me/{device_id}` purges all rows for a device on demand.
-
-If/when the app actually catches on, **add rate limiting and device-id signing.** Not before — that's premature.
+- `POST /event` stores only anonymous event names (`app_open`, `share_tap`,
+  `duel_created`, `duel_completed`) against the anonymous device id.
 
 ## What this server is NOT
 
-- Not authenticated. Anyone can `POST /round` with a fake `deviceId` and pollute the stats. For the current scale (low thousands of daily plays) this doesn't matter. If it ever does, add a rate limit + a per-device HMAC. That's a one-day change at most.
-- Not multi-region. Single Railway instance. Latency from the iOS app to the server is single-digit ms from Australia (Railway's Sydney edge).
-- Not a real database. SQLite. Fine for thousands of rows per day. Migrate to Postgres when you outgrow it.
-- Not a real admin dashboard. Use `sqlite3 ballpark.db` over SSH.
+- Not authenticated. Admin access is header-token protected only.
+- Not multi-region. Keep it simple until launch data says otherwise.
+- Not a dashboard UI. `/admin/summary` is the dashboard.
 
 ## License
 

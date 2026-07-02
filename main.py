@@ -33,25 +33,74 @@ import secrets
 import sqlite3
 import string
 from contextlib import contextmanager
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Mapping, Optional
+
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:  # pragma: no cover - local SQLite-only dev
+    psycopg = None
+    dict_row = None
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 # ----------------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------------
 
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 DB_PATH = os.environ.get("BALLPARK_DB", "ballpark.db")
 MAX_RETAINED_DAYS = int(os.environ.get("BALLPARK_RETAIN_DAYS", "60"))
 # Open duels older than this get expired by the retention sweep.
 # 7 days matches the iOS app's expectation (a daily puzzle's duel is
 # stale within ~48h, but we keep a week of headroom for slow friends).
 DUEL_EXPIRY_DAYS = int(os.environ.get("BALLPARK_DUEL_EXPIRY_DAYS", "7"))
+ADMIN_TOKEN = os.environ.get("BALLPARK_ADMIN_TOKEN", "").strip()
 DUEL_TOKEN_ALPHABET = string.ascii_letters + string.digits
 DUEL_TOKEN_LEN = 12
+USING_POSTGRES = DATABASE_URL.startswith(("postgres://", "postgresql://"))
+VALID_EVENT_NAMES = {"app_open", "share_tap", "duel_created", "duel_completed"}
+
+
+def current_timestamp() -> str:
+    """Canonical UTC timestamp string shared across SQLite and Postgres."""
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def parse_iso8601_utc(value: str) -> str:
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def cutoff_timestamp(days: int) -> str:
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .__sub__(timedelta(days=days))
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def day_start_utc(dt: Optional[datetime] = None) -> datetime:
+    base = dt or datetime.now(timezone.utc)
+    base = base.astimezone(timezone.utc)
+    return base.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
 def new_duel_token() -> str:
@@ -78,62 +127,150 @@ def _clean_device_id(v: str) -> str:
 
 @contextmanager
 def get_db():
-    """Context-managed SQLite connection. Uses a fresh connection
-    per request — SQLite's locking model is per-connection, and
-    FastAPI workers are short-lived. Cheap on this scale."""
-    conn = sqlite3.connect(DB_PATH, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
+    """Context-managed DB connection.
+
+    SQLite remains the local-dev fallback. Production uses Postgres
+    when `DATABASE_URL` is present.
+    """
+    if USING_POSTGRES:
+        if psycopg is None:
+            raise RuntimeError("psycopg is required when DATABASE_URL is set")
+        conn = psycopg.connect(DATABASE_URL, autocommit=True, row_factory=dict_row)
+    else:
+        conn = sqlite3.connect(DB_PATH, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
     try:
         yield conn
     finally:
         conn.close()
 
 
+def _sql(query: str) -> str:
+    return query.replace("?", "%s") if USING_POSTGRES else query
+
+
+def _execute(conn, query: str, params: tuple[Any, ...] = ()) -> None:
+    if USING_POSTGRES:
+        with conn.cursor() as cur:
+            cur.execute(_sql(query), params)
+    else:
+        conn.execute(query, params)
+
+
+def _fetchone(conn, query: str, params: tuple[Any, ...] = ()) -> Optional[Mapping[str, Any]]:
+    if USING_POSTGRES:
+        with conn.cursor() as cur:
+            cur.execute(_sql(query), params)
+            return cur.fetchone()
+    return conn.execute(query, params).fetchone()
+
+
+def _fetchall(conn, query: str, params: tuple[Any, ...] = ()) -> list[Mapping[str, Any]]:
+    if USING_POSTGRES:
+        with conn.cursor() as cur:
+            cur.execute(_sql(query), params)
+            return cur.fetchall()
+    return conn.execute(query, params).fetchall()
+
+
+@contextmanager
+def write_transaction(conn):
+    if USING_POSTGRES:
+        with conn.transaction():
+            yield
+        return
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
 def init_db() -> None:
     """Create the rounds + question_guesses tables if they don't
     exist. Called on app startup. Idempotent."""
     with get_db() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS rounds (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                device_id TEXT NOT NULL,
-                puzzle_number INTEGER NOT NULL,
-                total_score INTEGER NOT NULL,
-                played_at TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                UNIQUE(device_id, puzzle_number)
+        if USING_POSTGRES:
+            _execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS rounds (
+                    id BIGSERIAL PRIMARY KEY,
+                    device_id TEXT NOT NULL,
+                    puzzle_number INTEGER NOT NULL,
+                    total_score INTEGER NOT NULL,
+                    played_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(device_id, puzzle_number)
+                )
+                """,
             )
-            """
+        else:
+            _execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS rounds (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    device_id TEXT NOT NULL,
+                    puzzle_number INTEGER NOT NULL,
+                    total_score INTEGER NOT NULL,
+                    played_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(device_id, puzzle_number)
+                )
+                """,
+            )
+        _execute(
+            conn,
+            "CREATE INDEX IF NOT EXISTS idx_rounds_puzzle ON rounds(puzzle_number)",
         )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_rounds_puzzle ON rounds(puzzle_number)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_rounds_device ON rounds(device_id)"
+        _execute(
+            conn,
+            "CREATE INDEX IF NOT EXISTS idx_rounds_device ON rounds(device_id)",
         )
         # Per-question guesses, indexed by (puzzle_number, question_index)
         # for fast median lookups. question_index is 0-based position in
         # the daily round. guess is the player's slider value (a positive
         # Double, log-space). Nullable because legacy rounds (pre-C2) had
         # no per-question data.
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS question_guesses (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                device_id TEXT NOT NULL,
-                puzzle_number INTEGER NOT NULL,
-                question_index INTEGER NOT NULL,
-                guess REAL NOT NULL,
-                played_at TEXT NOT NULL,
-                UNIQUE(device_id, puzzle_number, question_index)
+        if USING_POSTGRES:
+            _execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS question_guesses (
+                    id BIGSERIAL PRIMARY KEY,
+                    device_id TEXT NOT NULL,
+                    puzzle_number INTEGER NOT NULL,
+                    question_index INTEGER NOT NULL,
+                    guess DOUBLE PRECISION NOT NULL,
+                    played_at TEXT NOT NULL,
+                    UNIQUE(device_id, puzzle_number, question_index)
+                )
+                """,
             )
-            """
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_qg_puzzle_q ON question_guesses(puzzle_number, question_index)"
+        else:
+            _execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS question_guesses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    device_id TEXT NOT NULL,
+                    puzzle_number INTEGER NOT NULL,
+                    question_index INTEGER NOT NULL,
+                    guess REAL NOT NULL,
+                    played_at TEXT NOT NULL,
+                    UNIQUE(device_id, puzzle_number, question_index)
+                )
+                """,
+            )
+        _execute(
+            conn,
+            "CREATE INDEX IF NOT EXISTS idx_qg_puzzle_q ON question_guesses(puzzle_number, question_index)",
         )
         # Duels (Phase D1). One row per duel. The initiator creates a
         # duel after finishing their round; the joiner claims the slot
@@ -145,7 +282,8 @@ def init_db() -> None:
         # initiator_device_id is nullable so /me can blank a deleted
         # user out of a duel without breaking the NOT NULL constraint
         # — the joiner sees the duel as 'expired' in that case.
-        conn.execute(
+        _execute(
+            conn,
             """
             CREATE TABLE IF NOT EXISTS duels (
                 duel_token TEXT PRIMARY KEY,
@@ -161,18 +299,53 @@ def init_db() -> None:
                 joiner_grid TEXT,
                 joiner_played_at TEXT,
                 status TEXT NOT NULL DEFAULT 'open',
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                created_at TEXT NOT NULL
             )
-            """
+            """,
         )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_duels_initiator ON duels(initiator_device_id)"
+        _execute(
+            conn,
+            "CREATE INDEX IF NOT EXISTS idx_duels_initiator ON duels(initiator_device_id)",
         )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_duels_joiner ON duels(joiner_device_id)"
+        _execute(
+            conn,
+            "CREATE INDEX IF NOT EXISTS idx_duels_joiner ON duels(joiner_device_id)",
         )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_duels_status ON duels(status, created_at)"
+        _execute(
+            conn,
+            "CREATE INDEX IF NOT EXISTS idx_duels_status ON duels(status, created_at)",
+        )
+        if USING_POSTGRES:
+            _execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS events (
+                    id BIGSERIAL PRIMARY KEY,
+                    device_id TEXT NOT NULL,
+                    event_name TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """,
+            )
+        else:
+            _execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    device_id TEXT NOT NULL,
+                    event_name TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """,
+            )
+        _execute(
+            conn,
+            "CREATE INDEX IF NOT EXISTS idx_events_name_created ON events(event_name, created_at)",
+        )
+        _execute(
+            conn,
+            "CREATE INDEX IF NOT EXISTS idx_events_device_created ON events(device_id, created_at)",
         )
 
 
@@ -183,7 +356,7 @@ def init_db() -> None:
 
 class RoundIn(BaseModel):
     puzzle_number: int = Field(..., gt=0, le=100_000)
-    total_score: int = Field(..., ge=0, le=1_500)  # 1 question (0-1000) + call-shot bonus headroom
+    total_score: int = Field(..., ge=0, le=10_500)  # 10 questions + call-shot bonus headroom
     device_id: str = Field(..., min_length=1, max_length=64)
     played_at: str = Field(..., min_length=10, max_length=40)
     # Optional per-question guesses. When present, length should equal
@@ -195,25 +368,15 @@ class RoundIn(BaseModel):
     @field_validator("device_id")
     @classmethod
     def _device_id_clean(cls, v: str) -> str:
-        # Restrict to URL-safe characters. identifierForVendor is a
-        # UUID, but be defensive.
-        allowed = set(
-            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
-        )
-        if not all(c in allowed for c in v):
-            raise ValueError("device_id contains invalid characters")
-        return v
+        return _clean_device_id(v)
 
     @field_validator("played_at")
     @classmethod
     def _played_at_iso8601(cls, v: str) -> str:
-        # Accept anything datetime.fromisoformat can parse. Reject
-        # everything else.
         try:
-            datetime.fromisoformat(v.replace("Z", "+00:00"))
+            return parse_iso8601_utc(v)
         except (ValueError, TypeError):
             raise ValueError("played_at must be ISO 8601")
-        return v
 
     @field_validator("guesses")
     @classmethod
@@ -252,6 +415,23 @@ class QuestionAggregateOut(BaseModel):
     count: int
 
 
+class EventIn(BaseModel):
+    device_id: str = Field(..., min_length=1, max_length=64)
+    event_name: str = Field(..., min_length=1, max_length=64)
+
+    @field_validator("device_id")
+    @classmethod
+    def _event_device(cls, v: str) -> str:
+        return _clean_device_id(v)
+
+    @field_validator("event_name")
+    @classmethod
+    def _event_name(cls, v: str) -> str:
+        if v not in VALID_EVENT_NAMES:
+            raise ValueError("unknown event_name")
+        return v
+
+
 # --- Duel models (Phase D1) -------------------------------------------------
 
 
@@ -264,7 +444,7 @@ class DuelCreateIn(BaseModel):
     theme_name: Optional[str] = Field(default=None, max_length=64)
     initiator_device_id: str = Field(..., min_length=1, max_length=64)
     initiator_name: Optional[str] = Field(default=None, max_length=64)
-    initiator_score: int = Field(..., ge=0, le=1_500)  # 1 question (0-1000) + call-shot bonus
+    initiator_score: int = Field(..., ge=0, le=10_500)  # 10 questions + call-shot bonus headroom
     # JSON-encoded array of color-tier ints (0..3), one per question.
     # Length cap is generous — rounds are currently 10 questions but
     # we don't want to break if that changes.
@@ -280,10 +460,9 @@ class DuelCreateIn(BaseModel):
     @classmethod
     def _init_played(cls, v: str) -> str:
         try:
-            datetime.fromisoformat(v.replace("Z", "+00:00"))
+            return parse_iso8601_utc(v)
         except (ValueError, TypeError):
             raise ValueError("initiator_played_at must be ISO 8601")
-        return v
 
 
 class DuelJoinIn(BaseModel):
@@ -304,7 +483,7 @@ class DuelResultIn(BaseModel):
     to 'completed'."""
 
     device_id: str = Field(..., min_length=1, max_length=64)
-    score: int = Field(..., ge=0, le=1_500)  # 1 question (0-1000) + call-shot bonus
+    score: int = Field(..., ge=0, le=10_500)  # 10 questions + call-shot bonus headroom
     grid: str = Field(default="[]", max_length=512)
     played_at: str = Field(..., min_length=10, max_length=40)
 
@@ -317,10 +496,9 @@ class DuelResultIn(BaseModel):
     @classmethod
     def _res_played(cls, v: str) -> str:
         try:
-            datetime.fromisoformat(v.replace("Z", "+00:00"))
+            return parse_iso8601_utc(v)
         except (ValueError, TypeError):
             raise ValueError("played_at must be ISO 8601")
-        return v
 
 
 class DuelOut(BaseModel):
@@ -340,22 +518,29 @@ class DuelOut(BaseModel):
     created_at: str
 
 
-def row_to_duel(row: sqlite3.Row) -> DuelOut:
+def _row_value(row: Mapping[str, Any], key: str):
+    value = row[key]
+    if isinstance(value, datetime):
+        return value.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return value
+
+
+def row_to_duel(row: Mapping[str, Any]) -> DuelOut:
     return DuelOut(
-        duel_token=row["duel_token"],
-        puzzle_number=row["puzzle_number"],
-        theme_name=row["theme_name"],
-        initiator_device_id=row["initiator_device_id"],
-        initiator_name=row["initiator_name"],
-        initiator_score=row["initiator_score"],
-        initiator_grid=row["initiator_grid"],
-        initiator_played_at=row["initiator_played_at"],
-        joiner_device_id=row["joiner_device_id"],
-        joiner_score=row["joiner_score"],
-        joiner_grid=row["joiner_grid"],
-        joiner_played_at=row["joiner_played_at"],
-        status=row["status"],
-        created_at=row["created_at"],
+        duel_token=_row_value(row, "duel_token"),
+        puzzle_number=_row_value(row, "puzzle_number"),
+        theme_name=_row_value(row, "theme_name"),
+        initiator_device_id=_row_value(row, "initiator_device_id"),
+        initiator_name=_row_value(row, "initiator_name"),
+        initiator_score=_row_value(row, "initiator_score"),
+        initiator_grid=_row_value(row, "initiator_grid"),
+        initiator_played_at=_row_value(row, "initiator_played_at"),
+        joiner_device_id=_row_value(row, "joiner_device_id"),
+        joiner_score=_row_value(row, "joiner_score"),
+        joiner_grid=_row_value(row, "joiner_grid"),
+        joiner_played_at=_row_value(row, "joiner_played_at"),
+        status=_row_value(row, "status"),
+        created_at=_row_value(row, "created_at"),
     )
 
 
@@ -415,15 +600,49 @@ def compute_question_aggregate(guesses: list[float]) -> dict:
     }
 
 
+def compute_d1_return(conn, latest_puzzle: int) -> float:
+    if latest_puzzle <= 1:
+        return 0.0
+    prev_puzzle = latest_puzzle - 1
+    previous_rows = _fetchall(
+        conn,
+        "SELECT DISTINCT device_id FROM rounds WHERE puzzle_number = ?",
+        (prev_puzzle,),
+    )
+    current_rows = _fetchall(
+        conn,
+        "SELECT DISTINCT device_id FROM rounds WHERE puzzle_number = ?",
+        (latest_puzzle,),
+    )
+    previous = {row["device_id"] for row in previous_rows}
+    current = {row["device_id"] for row in current_rows}
+    if not previous:
+        return 0.0
+    returned = len(previous & current)
+    return returned / len(previous)
+
+
 # ----------------------------------------------------------------------------
 # App
 # ----------------------------------------------------------------------------
 
 app = FastAPI(
     title="Ballpark Stats",
-    version="0.2.0",
-    description="Anonymous aggregate stats + daily friend duels for the Close Enough iOS app.",
+    version="0.3.0",
+    description="Anonymous aggregate stats + daily friend duels for the Ballpark iOS app.",
 )
+
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+def require_admin(request: Request) -> None:
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=503, detail="admin token not configured")
+    supplied = request.headers.get("x-admin-token") or request.query_params.get("token")
+    if supplied != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
 
 
 @app.on_event("startup")
@@ -432,13 +651,15 @@ def _startup() -> None:
 
 
 @app.get("/")
-def health() -> dict:
+@limiter.limit("120/minute")
+def health(request: Request) -> dict:
     """Liveness check for Railway / monitoring."""
     return {"ok": True, "service": "ballpark-stats"}
 
 
 @app.post("/round", status_code=204)
-def post_round(payload: RoundIn) -> Response:
+@limiter.limit("30/minute")
+def post_round(request: Request, payload: RoundIn) -> Response:
     """Record a played round. Re-posts for the same (device_id,
     puzzle_number) overwrite the prior score — handles re-plays
     after a 'clear today' debug tap.
@@ -450,23 +671,31 @@ def post_round(payload: RoundIn) -> Response:
     No PII stored: device_id is identifierForVendor (resets on
     reinstall), no name, email, contacts, location, or ad id."""
     with get_db() as conn:
-        # Upsert the round summary.
-        conn.execute(
+        created_at = current_timestamp()
+        _execute(
+            conn,
             """
-            INSERT INTO rounds (device_id, puzzle_number, total_score, played_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO rounds (device_id, puzzle_number, total_score, played_at, created_at)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(device_id, puzzle_number) DO UPDATE SET
                 total_score = excluded.total_score,
                 played_at = excluded.played_at
             """,
-            (payload.device_id, payload.puzzle_number, payload.total_score, payload.played_at),
+            (
+                payload.device_id,
+                payload.puzzle_number,
+                payload.total_score,
+                payload.played_at,
+                created_at,
+            ),
         )
         # Per-question guesses. Replay = overwrite (same as round summary).
         if payload.guesses:
             for q_index, guess in enumerate(payload.guesses):
                 if guess is None:
                     continue
-                conn.execute(
+                _execute(
+                    conn,
                     """
                     INSERT INTO question_guesses
                         (device_id, puzzle_number, question_index, guess, played_at)
@@ -481,17 +710,19 @@ def post_round(payload: RoundIn) -> Response:
 
 
 @app.get("/stats/{puzzle_number}", response_model=StatsOut)
-def get_stats(puzzle_number: int) -> StatsOut:
+@limiter.limit("120/minute")
+def get_stats(request: Request, puzzle_number: int) -> StatsOut:
     """Return aggregate stats for a puzzle. Returns count=0 if
     no data exists yet (the iOS app treats that as 'no line on
     the share card')."""
     if puzzle_number <= 0:
         raise HTTPException(status_code=400, detail="puzzle_number must be > 0")
     with get_db() as conn:
-        rows = conn.execute(
+        rows = _fetchall(
+            conn,
             "SELECT total_score FROM rounds WHERE puzzle_number = ?",
             (puzzle_number,),
-        ).fetchall()
+        )
     scores = [row["total_score"] for row in rows]
     payload = compute_stats(scores)
     return StatsOut(puzzle_number=puzzle_number, **payload)
@@ -501,7 +732,10 @@ def get_stats(puzzle_number: int) -> StatsOut:
     "/question-aggregate/{puzzle_number}/{question_index}",
     response_model=QuestionAggregateOut,
 )
-def get_question_aggregate(puzzle_number: int, question_index: int) -> QuestionAggregateOut:
+@limiter.limit("120/minute")
+def get_question_aggregate(
+    request: Request, puzzle_number: int, question_index: int
+) -> QuestionAggregateOut:
     """Median guess and count for a single (puzzle, question) pair.
     Powers the call-your-shot chip on the iOS round.
 
@@ -513,13 +747,14 @@ def get_question_aggregate(puzzle_number: int, question_index: int) -> QuestionA
     if question_index < 0 or question_index >= 20:
         raise HTTPException(status_code=400, detail="question_index out of range")
     with get_db() as conn:
-        rows = conn.execute(
+        rows = _fetchall(
+            conn,
             """
             SELECT guess FROM question_guesses
             WHERE puzzle_number = ? AND question_index = ?
             """,
             (puzzle_number, question_index),
-        ).fetchall()
+        )
     guesses = [row["guess"] for row in rows]
     payload = compute_question_aggregate(guesses)
     return QuestionAggregateOut(
@@ -529,13 +764,85 @@ def get_question_aggregate(puzzle_number: int, question_index: int) -> QuestionA
     )
 
 
+@app.post("/event", status_code=204)
+@limiter.limit("30/minute")
+def post_event(request: Request, payload: EventIn) -> Response:
+    with get_db() as conn:
+        _execute(
+            conn,
+            """
+            INSERT INTO events (device_id, event_name, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (payload.device_id, payload.event_name, current_timestamp()),
+        )
+    return Response(status_code=204)
+
+
+@app.get("/admin/summary")
+@limiter.limit("120/minute")
+def admin_summary(request: Request) -> dict:
+    require_admin(request)
+    with get_db() as conn:
+        latest = _fetchone(conn, "SELECT MAX(puzzle_number) AS max_puzzle FROM rounds")
+        latest_puzzle = int(latest["max_puzzle"] or 0)
+        latest_rows = _fetchall(
+            conn,
+            "SELECT DISTINCT device_id FROM rounds WHERE puzzle_number = ?",
+            (latest_puzzle,),
+        ) if latest_puzzle else []
+        daily_play_count = len(latest_rows)
+        d1_return_rate = compute_d1_return(conn, latest_puzzle)
+        today_start = day_start_utc().isoformat().replace("+00:00", "Z")
+        event_rows = _fetchall(
+            conn,
+            """
+            SELECT event_name, COUNT(*) AS event_count
+            FROM events
+            WHERE created_at >= ?
+            GROUP BY event_name
+            """,
+            (today_start,),
+        )
+        event_counts = {
+            row["event_name"]: int(row["event_count"]) for row in event_rows
+        }
+        share_taps = event_counts.get("share_tap", 0)
+        duel_created = event_counts.get("duel_created", 0)
+        duel_completed = event_counts.get("duel_completed", 0)
+        app_open = event_counts.get("app_open", 0)
+        share_rate = (share_taps / daily_play_count) if daily_play_count else 0.0
+        duel_completion_rate = (
+            duel_completed / duel_created if duel_created else 0.0
+        )
+        return {
+            "generated_at": current_timestamp(),
+            "latest_puzzle_number": latest_puzzle,
+            "daily_play_count": daily_play_count,
+            "d1_return_rate": round(d1_return_rate, 4),
+            "share_rate": round(share_rate, 4),
+            "duel_funnel": {
+                "created": duel_created,
+                "completed": duel_completed,
+                "completion_rate": round(duel_completion_rate, 4),
+            },
+            "event_counts_today": {
+                "app_open": app_open,
+                "share_tap": share_taps,
+                "duel_created": duel_created,
+                "duel_completed": duel_completed,
+            },
+        }
+
+
 # ----------------------------------------------------------------------------
 # Duels (Phase D1)
 # ----------------------------------------------------------------------------
 
 
 @app.post("/duel", response_model=DuelOut, status_code=201)
-def create_duel(payload: DuelCreateIn) -> DuelOut:
+@limiter.limit("30/minute")
+def create_duel(request: Request, payload: DuelCreateIn) -> DuelOut:
     """Initiator creates a duel after finishing their round. Returns
     the full duel row (including the token the iOS app uses to build
     the share URL `https://ballpark.app/d?k=<token>`).
@@ -544,13 +851,14 @@ def create_duel(payload: DuelCreateIn) -> DuelOut:
     random 'Adjective Noun' pair (or whatever the player typed)."""
     token = new_duel_token()
     with get_db() as conn:
-        conn.execute(
+        _execute(
+            conn,
             """
             INSERT INTO duels (
                 duel_token, puzzle_number, theme_name,
                 initiator_device_id, initiator_name, initiator_score,
-                initiator_grid, initiator_played_at, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open')
+                initiator_grid, initiator_played_at, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
             """,
             (
                 token,
@@ -561,16 +869,16 @@ def create_duel(payload: DuelCreateIn) -> DuelOut:
                 payload.initiator_score,
                 payload.initiator_grid,
                 payload.initiator_played_at,
+                current_timestamp(),
             ),
         )
-        row = conn.execute(
-            "SELECT * FROM duels WHERE duel_token = ?", (token,)
-        ).fetchone()
+        row = _fetchone(conn, "SELECT * FROM duels WHERE duel_token = ?", (token,))
     return row_to_duel(row)
 
 
 @app.get("/duel/{duel_token}", response_model=DuelOut)
-def get_duel(duel_token: str) -> DuelOut:
+@limiter.limit("120/minute")
+def get_duel(request: Request, duel_token: str) -> DuelOut:
     """Fetch a duel's current state. Used by both sides to poll for
     results (since APNs is deferred, the iOS app polls this on
     scenePhase becoming active)."""
@@ -579,16 +887,15 @@ def get_duel(duel_token: str) -> DuelOut:
     ):
         raise HTTPException(status_code=400, detail="invalid duel_token")
     with get_db() as conn:
-        row = conn.execute(
-            "SELECT * FROM duels WHERE duel_token = ?", (duel_token,)
-        ).fetchone()
+        row = _fetchone(conn, "SELECT * FROM duels WHERE duel_token = ?", (duel_token,))
     if row is None:
         raise HTTPException(status_code=404, detail="duel not found")
     return row_to_duel(row)
 
 
 @app.post("/duel/{duel_token}/join", response_model=DuelOut)
-def join_duel(duel_token: str, payload: DuelJoinIn) -> DuelOut:
+@limiter.limit("30/minute")
+def join_duel(request: Request, duel_token: str, payload: DuelJoinIn) -> DuelOut:
     """Claim the joiner slot of an open duel. Atomic: uses a single
     UPDATE with a WHERE guard so two simultaneous joiners can't both
     win. 409 if the duel is already claimed by a different device.
@@ -599,27 +906,19 @@ def join_duel(duel_token: str, payload: DuelJoinIn) -> DuelOut:
     ):
         raise HTTPException(status_code=400, detail="invalid duel_token")
     with get_db() as conn:
-        # BEGIN IMMEDIATE acquires a write lock immediately so the
-        # read-check-write below is atomic against other joiners.
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            row = conn.execute(
-                "SELECT * FROM duels WHERE duel_token = ?", (duel_token,)
-            ).fetchone()
+        with write_transaction(conn):
+            row = _fetchone(conn, "SELECT * FROM duels WHERE duel_token = ?", (duel_token,))
             if row is None:
-                conn.execute("ROLLBACK")
                 raise HTTPException(status_code=404, detail="duel not found")
             if row["status"] != "open":
                 # Already completed/expired — but allow the existing
                 # joiner to re-join (idempotent, useful if they tapped
                 # the link twice or the app re-handled the URL).
                 if row["joiner_device_id"] != payload.device_id:
-                    conn.execute("ROLLBACK")
                     raise HTTPException(
                         status_code=409, detail="duel already claimed"
                     )
             elif row["initiator_device_id"] == payload.device_id:
-                conn.execute("ROLLBACK")
                 raise HTTPException(
                     status_code=400, detail="can't join your own duel"
                 )
@@ -628,32 +927,27 @@ def join_duel(duel_token: str, payload: DuelJoinIn) -> DuelOut:
                 and row["joiner_device_id"] != payload.device_id
             ):
                 # Open duel but someone else already claimed the slot.
-                conn.execute("ROLLBACK")
                 raise HTTPException(
                     status_code=409, detail="duel already claimed"
                 )
             else:
-                conn.execute(
+                _execute(
+                    conn,
                     """
                     UPDATE duels SET joiner_device_id = ?
                     WHERE duel_token = ? AND status = 'open'
                     """,
                     (payload.device_id, duel_token),
                 )
-            row = conn.execute(
-                "SELECT * FROM duels WHERE duel_token = ?", (duel_token,)
-            ).fetchone()
-            conn.execute("COMMIT")
-        except HTTPException:
-            raise
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
+            row = _fetchone(conn, "SELECT * FROM duels WHERE duel_token = ?", (duel_token,))
     return row_to_duel(row)
 
 
 @app.post("/duel/{duel_token}/result", response_model=DuelOut)
-def submit_duel_result(duel_token: str, payload: DuelResultIn) -> DuelOut:
+@limiter.limit("30/minute")
+def submit_duel_result(
+    request: Request, duel_token: str, payload: DuelResultIn
+) -> DuelOut:
     """Submit a player's result. Updates whichever side matches
     device_id. If both sides now have scores, flips status to
     'completed'.
@@ -667,28 +961,23 @@ def submit_duel_result(duel_token: str, payload: DuelResultIn) -> DuelOut:
     ):
         raise HTTPException(status_code=400, detail="invalid duel_token")
     with get_db() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            row = conn.execute(
-                "SELECT * FROM duels WHERE duel_token = ?", (duel_token,)
-            ).fetchone()
+        with write_transaction(conn):
+            row = _fetchone(conn, "SELECT * FROM duels WHERE duel_token = ?", (duel_token,))
             if row is None:
-                conn.execute("ROLLBACK")
                 raise HTTPException(status_code=404, detail="duel not found")
             if row["status"] not in ("open", "completed"):
-                conn.execute("ROLLBACK")
                 raise HTTPException(
                     status_code=409, detail=f"duel is {row['status']}"
                 )
             is_initiator = row["initiator_device_id"] == payload.device_id
             is_joiner = row["joiner_device_id"] == payload.device_id
             if not (is_initiator or is_joiner):
-                conn.execute("ROLLBACK")
                 raise HTTPException(
                     status_code=403, detail="device is not in this duel"
                 )
             if is_initiator:
-                conn.execute(
+                _execute(
+                    conn,
                     """
                     UPDATE duels SET
                         initiator_score = ?,
@@ -699,7 +988,8 @@ def submit_duel_result(duel_token: str, payload: DuelResultIn) -> DuelOut:
                     (payload.score, payload.grid, payload.played_at, duel_token),
                 )
             if is_joiner:
-                conn.execute(
+                _execute(
+                    conn,
                     """
                     UPDATE duels SET
                         joiner_score = ?,
@@ -710,32 +1000,24 @@ def submit_duel_result(duel_token: str, payload: DuelResultIn) -> DuelOut:
                     (payload.score, payload.grid, payload.played_at, duel_token),
                 )
             # Flip to completed if both sides have scores.
-            row = conn.execute(
-                "SELECT * FROM duels WHERE duel_token = ?", (duel_token,)
-            ).fetchone()
+            row = _fetchone(conn, "SELECT * FROM duels WHERE duel_token = ?", (duel_token,))
             if (
                 row["initiator_score"] is not None
                 and row["joiner_score"] is not None
                 and row["status"] == "open"
             ):
-                conn.execute(
+                _execute(
+                    conn,
                     "UPDATE duels SET status = 'completed' WHERE duel_token = ?",
                     (duel_token,),
                 )
-                row = conn.execute(
-                    "SELECT * FROM duels WHERE duel_token = ?", (duel_token,)
-                ).fetchone()
-            conn.execute("COMMIT")
-        except HTTPException:
-            raise
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
+                row = _fetchone(conn, "SELECT * FROM duels WHERE duel_token = ?", (duel_token,))
     return row_to_duel(row)
 
 
 @app.get("/duels/open/{device_id}", response_model=list[DuelOut])
-def list_open_duels(device_id: str) -> list[DuelOut]:
+@limiter.limit("120/minute")
+def list_open_duels(request: Request, device_id: str) -> list[DuelOut]:
     """Open (not-completed, not-expired) duels where this device is
     either initiator or joiner. Polled by the iOS app on app open and
     on scenePhase becoming active — this is the polling fallback for
@@ -747,44 +1029,46 @@ def list_open_duels(device_id: str) -> list[DuelOut]:
     except ValueError:
         raise HTTPException(status_code=400, detail="invalid device_id")
     with get_db() as conn:
-        rows = conn.execute(
+        rows = _fetchall(
+            conn,
             """
             SELECT * FROM duels
             WHERE status = 'open'
               AND (initiator_device_id = ? OR joiner_device_id = ?)
-              AND created_at >= datetime('now', ?)
+              AND created_at >= ?
             ORDER BY created_at DESC
             """,
-            (device_id, device_id, f"-{DUEL_EXPIRY_DAYS} days"),
-        ).fetchall()
+            (device_id, device_id, cutoff_timestamp(DUEL_EXPIRY_DAYS)),
+        )
     return [row_to_duel(r) for r in rows]
 
 
 @app.delete("/me/{device_id}", status_code=204)
-def delete_device(device_id: str) -> Response:
+@limiter.limit("30/minute")
+def delete_device(request: Request, device_id: str) -> Response:
     """Purge all rows for a device. Wired up from a 'Delete my data'
     button in the iOS app's settings screen. Cascades to per-question
     guesses so the call-your-shot aggregate for this device is also
     removed. Also removes the device from any duel (initiator or
     joiner) — the duel row is kept so the other side still has a
     result, but this device's identity is blanked."""
-    if not (1 <= len(device_id) <= 64):
-        raise HTTPException(status_code=400, detail="invalid device_id")
-    allowed = set(
-        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
-    )
-    if not all(c in allowed for c in device_id):
+    try:
+        _clean_device_id(device_id)
+    except ValueError:
         raise HTTPException(status_code=400, detail="invalid device_id characters")
     with get_db() as conn:
-        conn.execute("DELETE FROM rounds WHERE device_id = ?", (device_id,))
-        conn.execute(
+        _execute(conn, "DELETE FROM rounds WHERE device_id = ?", (device_id,))
+        _execute(
+            conn,
             "DELETE FROM question_guesses WHERE device_id = ?", (device_id,)
         )
+        _execute(conn, "DELETE FROM events WHERE device_id = ?", (device_id,))
         # Blank this device out of any duel it's in. We don't delete
         # the row because the other side may still want their result.
         # If the device was the initiator of an open duel, the duel is
         # effectively dead — flip to 'expired'.
-        conn.execute(
+        _execute(
+            conn,
             """
             UPDATE duels SET
                 initiator_device_id = NULL,
@@ -796,7 +1080,8 @@ def delete_device(device_id: str) -> Response:
             """,
             (device_id,),
         )
-        conn.execute(
+        _execute(
+            conn,
             """
             UPDATE duels SET
                 joiner_device_id = NULL,
@@ -807,7 +1092,8 @@ def delete_device(device_id: str) -> Response:
             """,
             (device_id,),
         )
-        conn.execute(
+        _execute(
+            conn,
             """
             UPDATE duels SET status = 'expired'
             WHERE status = 'open' AND initiator_device_id IS NULL
@@ -817,7 +1103,8 @@ def delete_device(device_id: str) -> Response:
 
 
 @app.get("/privacy", response_class=HTMLResponse)
-def privacy_page() -> str:
+@limiter.limit("120/minute")
+def privacy_page(request: Request) -> str:
     """Public-facing privacy disclosure. Required for App Store
     review. Plain HTML, no external assets, safe to be cached."""
     return """<!DOCTYPE html>
@@ -839,7 +1126,7 @@ def privacy_page() -> str:
 <body>
 <h1>Ballpark Stats — Privacy</h1>
 
-<p>Close Enough collects anonymous puzzle scores to power a
+<p>Ballpark collects anonymous puzzle scores to power a
 &ldquo;you scored higher than X% of today&rsquo;s players&rdquo; line
 on share cards.</p>
 
@@ -853,6 +1140,9 @@ on share cards.</p>
   <li>The date you played.</li>
   <li>An anonymous device identifier (Apple&rsquo;s <code>identifierForVendor</code>,
       which resets if you reinstall the app).</li>
+  <li>Anonymous event pings when you open the app, tap share, create a duel,
+      or complete a duel. These events contain only your anonymous device id,
+      the event name, and the time it happened.</li>
   <li>When you start or join a duel: the duel token, your device id,
       the name you typed (optional — defaults to a random
       &ldquo;Adjective Noun&rdquo;), your score, and your color-tier
@@ -869,7 +1159,7 @@ on share cards.</p>
 </ul>
 
 <h2>How to opt out</h2>
-<p>In the Close Enough app, go to <strong>Settings &rarr; Privacy</strong>
+<p>In the Ballpark app, go to <strong>Settings &rarr; Privacy</strong>
 and toggle &ldquo;Share anonymous stats&rdquo; off. The app will stop
 sending data immediately.</p>
 
@@ -903,36 +1193,45 @@ async def maybe_cleanup_old_data(request: Request, call_next):
     if random.random() < 0.001:  # ~0.1% of requests
         try:
             with get_db() as conn:
-                # Use SQLite's own datetime arithmetic so the cutoff
-                # matches the stored `datetime('now')` format. This
-                # avoids any timezone mismatch between Python's
-                # datetime.now() and SQLite's UTC-less "now" string.
-                conn.execute(
+                retained_cutoff = cutoff_timestamp(MAX_RETAINED_DAYS)
+                duel_cutoff = cutoff_timestamp(DUEL_EXPIRY_DAYS)
+                _execute(
+                    conn,
                     """
                     DELETE FROM rounds
-                    WHERE created_at < datetime('now', ?)
+                    WHERE created_at < ?
                     """,
-                    (f"-{MAX_RETAINED_DAYS} days",),
+                    (retained_cutoff,),
                 )
-                conn.execute(
+                _execute(
+                    conn,
                     """
                     DELETE FROM question_guesses
-                    WHERE played_at < datetime('now', ?)
+                    WHERE played_at < ?
                     """,
-                    (f"-{MAX_RETAINED_DAYS} days",),
+                    (retained_cutoff,),
+                )
+                _execute(
+                    conn,
+                    """
+                    DELETE FROM events
+                    WHERE created_at < ?
+                    """,
+                    (retained_cutoff,),
                 )
                 # Expire open duels older than DUEL_EXPIRY_DAYS. We
                 # flip to 'expired' rather than DELETE so a slow
                 # joiner who opens the link after the cutoff gets a
                 # clean 'this duel has expired' message instead of a
                 # 404 (which would look like a typo).
-                conn.execute(
+                _execute(
+                    conn,
                     """
                     UPDATE duels SET status = 'expired'
                     WHERE status = 'open'
-                      AND created_at < datetime('now', ?)
+                      AND created_at < ?
                     """,
-                    (f"-{DUEL_EXPIRY_DAYS} days",),
+                    (duel_cutoff,),
                 )
         except Exception:
             # Retention cleanup is best-effort. Don't break the
